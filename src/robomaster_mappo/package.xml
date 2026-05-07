@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robomaster_mappo</name>
+  <version>0.1.0</version>
+  <description>MAPPO reinforcement learning for RoboMaster</description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>python3-torch</depend>
+  <depend>python3-numpy</depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

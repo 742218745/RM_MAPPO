@@ -1,0 +1,3 @@
+[console_scripts]
+mappo_train = robomaster_mappo.train:main
+

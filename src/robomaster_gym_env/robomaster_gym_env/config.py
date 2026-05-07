@@ -1,0 +1,106 @@
+"""
+Gym环境配置文件
+定义所有ROS2节点、Topics、消息类型等配置信息
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+
+
+@dataclass
+class GymEnvConfig:
+    """Gym环境配置"""
+    # 机器人配置
+    robot_name: str = "red_standard_robot1"
+    robot_namespace: str = "red_standard_robot1"  # ✅ 修复:不要以斜杠开头
+    team: str = "red"
+
+    # 仿真配置
+    use_sim_time: bool = True
+    timeout_steps: int = 10000
+    control_frequency: float = 30.0  # Hz (仿真时间基准)
+
+    # 动作空间配置
+    # 云台锁定初始朝向, 不作为动作空间
+    action_config: Dict[str, bool] = field(default_factory=lambda: {
+        'chassis_velocity': True,
+        'shoot': True,
+    })
+
+    # 奖励配置
+    reward_config: Dict[str, float] = field(default_factory=lambda: {
+        'hit_enemy': 50.0,
+        'be_hit': -50.0,
+        # 存活奖励
+        'survive_per_step': 0.01,
+        # 弹药惩罚
+        'ammo_usage': -0.1,
+        'out_of_boundary': -100.0,
+        # 翻车惩罚 (翻车时 terminated=True, 奖励覆盖为此值)
+        'tumble': -10.0,
+        # 在敌方4m范围内的奖励
+        'near_enemy_bonus': 0.1,
+        # 距离渐变奖励: (1 - distance/max_distance) * weight, 距离越近奖励越大
+        'distance_reward': 1.0,
+        # 距离缩减塑形奖励: (last_dist - cur_dist) * weight, 靠近为正远离为负
+        'distance_shaping': 2.0,
+        # 场地最大距离(用于距离渐变奖励归一化)
+        'max_field_distance': 30.0,
+    })
+
+    # 课程学习配置
+    curriculum_config: Dict[str, any] = field(default_factory=lambda: {
+        # 是否启用课程学习
+        'enabled': True,
+        # 当前训练阶段: 1=近距离, 2=中距离, 3=远距离, 4=全场随机
+        'stage': 1,
+        # 各阶段蓝方距离范围(相对于红方初始位置的最小/最大距离, 单位m)
+        'stage_ranges': {
+            1: (3.0, 6.0),    # 近距离: 3-6m
+            2: (6.0, 12.0),   # 中距离: 6-12m
+            3: (12.0, 20.0),  # 远距离: 12-20m
+            4: (3.0, 25.0),   # 全场随机: 3-25m
+        },
+        # 各阶段训练episode数(达到后自动升级阶段)
+        'stage_episodes': {
+            1: 200,
+            2: 300,
+            3: 500,
+            4: -1,  # -1表示不自动升级
+        },
+        # 使用虚拟蓝方位置(不移动Gazebo中的蓝方, 仅在奖励计算中使用)
+        'use_virtual_blue': True,
+        # 虚拟蓝方位置是否覆盖观测空间中的蓝方位置
+        # True: 观测中蓝方位置=虚拟位置(策略网络看到虚拟目标)
+        # False: 观测中蓝方位置=真实Gazebo位置(策略网络看到真实位置)
+        'virtual_blue_override_obs': True,
+    })
+
+    # 虚拟蓝方位置(由课程学习在reset时生成, 不影响Gazebo仿真)
+    virtual_blue_x: float = 9.4   # 默认与gz_world.yaml中蓝方初始位置一致
+    virtual_blue_y: float = 9.5
+
+    # 控制限制
+    chassis_velocity_limit: Dict[str, float] = field(default_factory=lambda: {
+        'linear_x_max': 2.0,    # m/s
+        'linear_y_max': 2.0,    # m/s
+    })
+
+    shoot_config: Dict[str, float] = field(default_factory=lambda: {
+        'projectile_velocity': 25.0,  # m/s
+        'max_projectile_num': 5,
+        'cooldown_time': 0.1,   # s
+    })
+
+    # 场地固定目标坐标 (单位: m)
+    # 红方前哨站/基地 (己方为红时)
+    red_outpost_position: Tuple[float, float, float] = (11.0, 11.35, 16.0)
+    red_base_position: Tuple[float, float, float] = (2.4, 7.5, 3.15)
+    # 蓝方前哨站/基地 (己方为蓝时)
+    blue_outpost_position: Tuple[float, float, float] = (17.0, 3.65, 16.0)
+    blue_base_position: Tuple[float, float, float] = (25.6, 7.5, 3.15)
+
+
+# 默认配置实例
+DEFAULT_GYM_CONFIG = GymEnvConfig()
