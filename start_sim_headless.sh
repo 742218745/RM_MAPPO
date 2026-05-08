@@ -13,7 +13,8 @@ export ROS_DISABLE_FASTRTPS_SHM=1
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 # Source ROS2 工作空间
-source /home/xufurui/ros_ws/install/setup.bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/install/setup.bash"
 
 # 清理残留进程和共享内存
 cleanup_before() {
