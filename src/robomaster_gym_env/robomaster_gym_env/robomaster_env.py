@@ -95,8 +95,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         
         # real_time_factor: 仿真加速倍数
         # 需要与 Gazebo 世界文件中的 real_time_factor 一致
-        # 2.0 表示仿真时间流速是真实时间的 2 倍
-        self.real_time_factor = 2.0
+        # 3.0 表示仿真时间流速是真实时间的 3 倍
+        self.real_time_factor = 3.0
 
         # 每步伤害（固定为10）
         self.damage_per_step = 10.0
