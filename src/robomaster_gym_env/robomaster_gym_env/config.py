@@ -84,6 +84,7 @@ class GymEnvConfig:
     virtual_blue_y: float = 9.5
 
     # 特化模式配置 (用于专项训练, 启用后原奖励不生效)
+    # 分阶段引导: 起点 → 中间点(坡) → 目标点
     specialize_config: Dict[str, any] = field(default_factory=lambda: {
         'enabled': True,
         # 固定初始位置 (不随机落点)
@@ -92,28 +93,31 @@ class GymEnvConfig:
         # 固定目标位置 (地图中心)
         'target_x': 14.0,
         'target_y': 7.5,
-        # 靠近目标2m内才有奖励
-        'approach_radius': 2.0,
-        'approach_reward': 5.0,
-        # 中间奖励点: 距离越近奖励越高, 上限随时间递减
+        # 中间点坐标 (必须经过的坡道点)
         'waypoint_x': 4.81,
         'waypoint_y': 2.47,
-        'waypoint_reward_max': 5.0,       # 奖励上限
-        'waypoint_sigma': 5.0,            # 距离衰减参数, 超过此距离奖励为0
-        'waypoint_decay_steps': -1,       # 奖励上限递减到0的步数, -1表示=max_steps
-        # 速度方向一致性奖励 (5步内方向保持一致)
-        'consistency_window': 5,          # 方向一致性检测窗口
-        'consistency_reward': 0.1,        # 方向一致时的奖励
-        # 反向速度惩罚 (速度直接反向, 归零不惩罚)
-        'reverse_penalty': -0.05,         # 方向反向时的惩罚
+        'waypoint_arrive_radius': 1.5,    # 到达中间点的判定半径(m)
+        'waypoint_arrive_reward': 10.0,   # 到达中间点的奖励
+        'waypoint_shaping_weight': 3.0,   # 阶段1: 距离塑形权重(靠近中间点)
+        # 目标到达奖励
+        'approach_radius': 2.0,           # 到达目标的判定半径(m)
+        'approach_reward': 10.0,          # 到达目标的奖励
+        'target_shaping_weight': 3.0,     # 阶段2: 距离塑形权重(靠近目标)
+        # 爬坡奖励 (阶段1: 上坡段, 强化)
+        'climb_reward': 1.0,              # 阶段1: z轴上升奖励
+        'descend_penalty': -0.5,          # 阶段1: z轴下降惩罚
+        # 爬坡奖励 (阶段2: 下坡/平地段, 弱化)
+        'climb_reward_phase2': 0.1,       # 阶段2: z轴上升奖励(弱)
+        'descend_penalty_phase2': -1.0,   # 阶段2: z轴下降惩罚(强, 防止掉回坡下)
+        # 速度方向与目标方向一致性
+        'direction_reward': 1.0,          # 速度朝目标方向投影的奖励
+        # 速度大小奖励 (鼓励快速移动)
+        'speed_reward': 0.2,              # 阶段1: 速度大小奖励
+        'speed_reward_phase2': 0.3,       # 阶段2: 速度大小奖励(平地可更快)
+        # 反向速度惩罚
+        'reverse_penalty': -0.5,          # 速度与目标方向反向时的惩罚
         # 时间惩罚 (每步)
-        'time_penalty': -0.01,
-        # 往更远处走惩罚 (远离目标)
-        'retreat_penalty': 0.0,
-        # 往高处走奖励 (z轴上升)
-        'climb_reward': 0.3,
-        # 往低处走惩罚 (z轴下降)
-        'descend_penalty': -0.3,
+        'time_penalty': -0.02,
         # 卡住时回退步数
         'stuck_rollback_steps': 30,
     })

@@ -404,6 +404,7 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         self._speed_history = []  # 重置卡住检测历史
         self._spec_last_dist = None  # 重置特化模式距离历史
         self._spec_last_z = None  # 重置特化模式高度历史
+        self._spec_waypoint_reached = False  # 重置中间点到达标记
         self._position_history = []  # 重置位置历史
         self._vel_dir_history = []  # 重置速度方向历史
 
@@ -560,18 +561,21 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         return False
 
     def _calculate_specialize_reward(self, spec_cfg: Dict) -> float:
-        """特化模式奖励计算
+        """特化模式奖励计算 - 分阶段引导
+
+        路径: 起点 → 中间点(坡) → 目标点
+        阶段1(未到达中间点): 引导去中间点, 强化爬坡, 不惩罚远离目标
+        阶段2(已到达中间点): 引导去目标点, 不惩罚远离中间点
 
         规则:
-        - 靠近目标2m内: 有奖励 (原有逻辑)
-        - 中间奖励点: 距离越近奖励越高, 上限随时间递减
-        - 速度方向一致性: 5步内方向保持一致有奖励
-        - 反向速度惩罚: 速度直接反向给小惩罚, 归零不惩罚
-        - 时间推移: 有惩罚
-        - 往更远处走: 有惩罚
-        - 往高处走: 有奖励
-        - 往低处走: 有惩罚
-        - 碰墙: 有惩罚
+        - 分阶段距离塑形奖励: 靠近当前阶段目标给正奖励, 远离给惩罚
+        - 中间点到达奖励: 首次进入waypoint半径内给大奖励
+        - 目标到达奖励: 进入目标半径内给大奖励
+        - 爬坡奖励: 阶段1(上坡段)强化, 阶段2弱化
+        - 速度方向与目标方向一致性: 速度朝当前阶段目标方向给奖励
+        - 速度大小奖励: 鼓励快速移动
+        - 时间惩罚: 每步小惩罚
+        - 翻车/碰墙惩罚
         """
         reward = 0.0
 
@@ -583,95 +587,123 @@ class RoboMasterGazeboEnv(gymnasium.Env):
 
         target_x = spec_cfg.get('target_x', 14.0)
         target_y = spec_cfg.get('target_y', 7.5)
-
-        # 计算到目标的水平距离
-        dist_to_target = np.sqrt((own_x - target_x)**2 + (own_y - target_y)**2)
-
-        # 1. 靠近目标奖励: 2m内才有 (原有逻辑)
-        approach_radius = spec_cfg.get('approach_radius', 2.0)
-        approach_reward = spec_cfg.get('approach_reward', 1.0)
-        if dist_to_target <= approach_radius:
-            reward += approach_reward * (1.0 - dist_to_target / approach_radius)
-
-        # 2. 中间奖励点: 距离越近奖励越高, 上限随时间递减
-        #    reward = max_reward * (1 - dist/sigma) * decay(t)
         waypoint_x = spec_cfg.get('waypoint_x', 4.81)
         waypoint_y = spec_cfg.get('waypoint_y', 2.47)
-        dist_to_waypoint = np.sqrt((own_x - waypoint_x)**2 + (own_y - waypoint_y)**2)
-        waypoint_reward_max = spec_cfg.get('waypoint_reward_max', 2.0)
-        waypoint_sigma = spec_cfg.get('waypoint_sigma', 5.0)
-        waypoint_decay_steps = spec_cfg.get('waypoint_decay_steps', -1)
-        if waypoint_decay_steps == -1:
-            waypoint_decay_steps = self.max_steps
-        if dist_to_waypoint < waypoint_sigma:
-            wp_proximity = 1.0 - dist_to_waypoint / waypoint_sigma  # [0, 1]
-        else:
-            wp_proximity = 0.0
-        wp_progress = min(self.current_step / max(waypoint_decay_steps, 1), 1.0)
-        wp_time_decay = 1.0 - wp_progress
-        reward += waypoint_reward_max * wp_proximity * wp_time_decay
 
-        # 3. 速度方向一致性奖励 + 反向速度惩罚
+        # 计算到各关键点的距离
+        dist_to_target = np.sqrt((own_x - target_x)**2 + (own_y - target_y)**2)
+        dist_to_waypoint = np.sqrt((own_x - waypoint_x)**2 + (own_y - waypoint_y)**2)
+
+        # ---- 阶段判断 ----
+        waypoint_arrive_radius = spec_cfg.get('waypoint_arrive_radius', 1.5)
+        # 一旦到达中间点, 整个episode内保持阶段2
+        if dist_to_waypoint <= waypoint_arrive_radius:
+            self._spec_waypoint_reached = True
+
+        is_phase1 = not self._spec_waypoint_reached  # 阶段1: 去中间点
+
+        # ---- 1. 分阶段距离塑形奖励 (核心) ----
+        # 阶段1: 靠近中间点给正奖励, 远离中间点给惩罚
+        # 阶段2: 靠近目标点给正奖励, 远离目标点给惩罚
+        if is_phase1:
+            shaping_weight = spec_cfg.get('waypoint_shaping_weight', 3.0)
+            if self._spec_last_dist is None:
+                self._spec_last_dist = dist_to_waypoint
+            dist_delta = dist_to_waypoint - self._spec_last_dist  # 正值=远离中间点
+            reward -= shaping_weight * dist_delta  # 靠近中间点→正奖励, 远离→惩罚
+            self._spec_last_dist = dist_to_waypoint
+        else:
+            shaping_weight = spec_cfg.get('target_shaping_weight', 3.0)
+            if self._spec_last_dist is None:
+                self._spec_last_dist = dist_to_target
+            dist_delta = dist_to_target - self._spec_last_dist  # 正值=远离目标
+            reward -= shaping_weight * dist_delta  # 靠近目标→正奖励, 远离→惩罚
+            self._spec_last_dist = dist_to_target
+
+        # ---- 2. 中间点到达奖励 ----
+        waypoint_arrive_reward = spec_cfg.get('waypoint_arrive_reward', 10.0)
+        if is_phase1 and dist_to_waypoint <= waypoint_arrive_radius:
+            # 在中间点附近给额外奖励, 越近越大
+            proximity = 1.0 - dist_to_waypoint / waypoint_arrive_radius
+            reward += waypoint_arrive_reward * proximity
+
+        # ---- 3. 目标到达奖励 ----
+        approach_radius = spec_cfg.get('approach_radius', 2.0)
+        approach_reward = spec_cfg.get('approach_reward', 10.0)
+        if not is_phase1 and dist_to_target <= approach_radius:
+            proximity = 1.0 - dist_to_target / approach_radius
+            reward += approach_reward * proximity
+
+        # ---- 4. 爬坡奖励/下坡惩罚 ----
+        # 阶段1(上坡段): 强化爬坡奖励, 鼓励往上走
+        # 阶段2(下坡/平地段): 弱化, 只惩罚下坡(防止掉回去)
+        climb_reward = spec_cfg.get('climb_reward', 1.0)
+        descend_penalty = spec_cfg.get('descend_penalty', -0.5)
+        climb_reward_phase2 = spec_cfg.get('climb_reward_phase2', 0.1)
+        descend_penalty_phase2 = spec_cfg.get('descend_penalty_phase2', -1.0)
+        if self._spec_last_z is None:
+            self._spec_last_z = own_z
+        z_delta = own_z - self._spec_last_z  # 正值=上升
+        if is_phase1:
+            if z_delta > 0:
+                reward += climb_reward * z_delta
+            elif z_delta < 0:
+                reward += descend_penalty * abs(z_delta)
+        else:
+            if z_delta > 0:
+                reward += climb_reward_phase2 * z_delta
+            elif z_delta < 0:
+                reward += descend_penalty_phase2 * abs(z_delta)
+        self._spec_last_z = own_z
+
+        # ---- 5. 速度方向与目标方向一致性 ----
+        # 速度朝当前阶段目标方向投影为正时给奖励
         odom = self.ros2_interface.get_odom()
         if odom is not None:
             vx = odom.get('linear_x', 0.0)
             vy = odom.get('linear_y', 0.0)
             speed = np.sqrt(vx**2 + vy**2)
-            if speed > 0.05:
-                direction = np.array([vx / speed, vy / speed])
+
+            # 当前阶段目标方向
+            if is_phase1:
+                goal_dx = waypoint_x - own_x
+                goal_dy = waypoint_y - own_y
             else:
-                direction = None  # 速度归零, 不算方向
+                goal_dx = target_x - own_x
+                goal_dy = target_y - own_y
+            goal_dist = np.sqrt(goal_dx**2 + goal_dy**2)
 
-            self._vel_dir_history.append(direction)
-            if len(self._vel_dir_history) > 5:
-                self._vel_dir_history = self._vel_dir_history[-5:]
+            if speed > 0.05 and goal_dist > 0.1:
+                # 速度在目标方向上的投影 (归一化)
+                vel_dot_goal = (vx * goal_dx + vy * goal_dy) / (speed * goal_dist)
+                # vel_dot_goal ∈ [-1, 1], 1=完全朝目标, -1=完全反向
+                direction_reward = spec_cfg.get('direction_reward', 1.0)
+                reward += direction_reward * vel_dot_goal
 
-            consistency_reward = spec_cfg.get('consistency_reward', 0.1)
-            reverse_penalty = spec_cfg.get('reverse_penalty', -0.05)
+            # 速度大小奖励: 鼓励快速移动 (阶段1上坡时更重要)
+            speed_reward = spec_cfg.get('speed_reward', 0.2)
+            speed_reward_phase2 = spec_cfg.get('speed_reward_phase2', 0.3)
+            if is_phase1:
+                reward += speed_reward * speed
+            else:
+                reward += speed_reward_phase2 * speed
 
-            valid_dirs = [d for d in self._vel_dir_history if d is not None]
-            if len(valid_dirs) >= 2:
-                d_prev = valid_dirs[-2]
-                d_curr = valid_dirs[-1]
-                dot = np.dot(d_prev, d_curr)  # [-1, 1]
+            # 反向速度惩罚 (速度与目标方向夹角>90°)
+            if speed > 0.05 and goal_dist > 0.1:
+                vel_dot_goal = (vx * goal_dx + vy * goal_dy) / (speed * goal_dist)
+                reverse_penalty = spec_cfg.get('reverse_penalty', -0.5)
+                if vel_dot_goal < 0:
+                    reward += reverse_penalty * abs(vel_dot_goal)
 
-                if dot > 0:
-                    # 方向一致 (夹角<90°), 给奖励
-                    reward += consistency_reward * dot
-                elif dot < 0:
-                    # 方向反向 (夹角>90°), 给惩罚
-                    reward += reverse_penalty * abs(dot)
-
-        # 4. 时间惩罚: 每步都有, 但低于接近奖励
-        time_penalty = spec_cfg.get('time_penalty', -0.01)
+        # ---- 6. 时间惩罚 ----
+        time_penalty = spec_cfg.get('time_penalty', -0.02)
         reward += time_penalty
 
-        # 5. 远离目标惩罚: 距离增大时惩罚
-        retreat_penalty = spec_cfg.get('retreat_penalty', -0.5)
-        if self._spec_last_dist is None:
-            self._spec_last_dist = dist_to_target
-        dist_delta = dist_to_target - self._spec_last_dist  # 正值=远离
-        if dist_delta > 0:
-            reward += retreat_penalty * dist_delta
-        self._spec_last_dist = dist_to_target
-
-        # 5. 高度变化奖励/惩罚
-        climb_reward = spec_cfg.get('climb_reward', 0.3)
-        descend_penalty = spec_cfg.get('descend_penalty', -0.3)
-        if self._spec_last_z is None:
-            self._spec_last_z = own_z
-        z_delta = own_z - self._spec_last_z  # 正值=上升
-        if z_delta > 0:
-            reward += climb_reward * z_delta
-        elif z_delta < 0:
-            reward += descend_penalty * abs(z_delta)
-        self._spec_last_z = own_z
-
-        # 6. 翻车惩罚
+        # ---- 7. 翻车惩罚 ----
         if self.ros2_interface.is_tumbled():
             reward += self.config.reward_config.get('tumble', -10.0)
 
-        # 7. 碰墙惩罚 + 回退到30步前位置
+        # ---- 8. 碰墙惩罚 + 回退 ----
         if self._check_stuck():
             reward += self.config.reward_config.get('stuck_penalty', -1.0)
             rollback_steps = spec_cfg.get('stuck_rollback_steps', 30)
