@@ -1,0 +1,18 @@
+[submodule "src/pb2025_robot_description"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/pb2025_robot_description.git
+	branch = main
+[submodule "src/rmoss_core"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/rmoss_core.git
+	branch = main
+[submodule "src/rmoss_gazebo"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/rmoss_gazebo.git
+	branch = main
+[submodule "src/rmoss_gz_resources"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/rmoss_gz_resources.git
+	branch = main
+[submodule "src/rmoss_interfaces"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/rmoss_interfaces.git
+	branch = main
+[submodule "src/rmu_gazebo_simulator"]
+	url = https://github.com/SMBU-PolarBear-Robotics-Team/rmu_gazebo_simulator.git
+	branch = main
