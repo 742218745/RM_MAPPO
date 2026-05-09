@@ -27,7 +27,7 @@ class InterfaceData:
 
     # 环境状态
     current_step: int = 0
-    max_steps: int = 10000
+    max_steps: int = 2048
 
 
 class InterfaceAdapter:

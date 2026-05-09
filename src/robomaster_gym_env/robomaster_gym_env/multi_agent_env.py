@@ -142,7 +142,7 @@ class RoboMasterMultiAgentEnv(gymnasium.Env):
 
         # 环境状态
         self.current_step = 0
-        self.max_steps = 2100
+        self.max_steps = 2048
         self.control_period = 1.0 / self.base_config.control_frequency
         self.last_control_time = 0.0
 

@@ -39,6 +39,8 @@ class GymEnvConfig:
         'out_of_boundary': -100.0,
         # 翻车惩罚 (翻车时 terminated=True, 奖励覆盖为此值)
         'tumble': -10.0,
+        # 碰墙惩罚 (底盘卡住时每步惩罚)
+        'stuck_penalty': -1.0,
         # 在敌方4m范围内的奖励
         'near_enemy_bonus': 0.1,
         # 距离渐变奖励: (1 - distance/max_distance) * weight, 距离越近奖励越大
@@ -64,9 +66,9 @@ class GymEnvConfig:
         },
         # 各阶段训练episode数(达到后自动升级阶段)
         'stage_episodes': {
-            1: 200,
-            2: 300,
-            3: 500,
+            1: 300,
+            2: 400,
+            3: 600,
             4: -1,  # -1表示不自动升级
         },
         # 使用虚拟蓝方位置(不移动Gazebo中的蓝方, 仅在奖励计算中使用)
@@ -81,10 +83,45 @@ class GymEnvConfig:
     virtual_blue_x: float = 9.4   # 默认与gz_world.yaml中蓝方初始位置一致
     virtual_blue_y: float = 9.5
 
+    # 特化模式配置 (用于专项训练, 启用后原奖励不生效)
+    specialize_config: Dict[str, any] = field(default_factory=lambda: {
+        'enabled': True,
+        # 固定初始位置 (不随机落点)
+        'start_x': 8.64,
+        'start_y': 3.65,
+        # 固定目标位置 (地图中心)
+        'target_x': 14.0,
+        'target_y': 7.5,
+        # 靠近目标2m内才有奖励
+        'approach_radius': 2.0,
+        'approach_reward': 5.0,
+        # 中间奖励点: 距离越近奖励越高, 上限随时间递减
+        'waypoint_x': 4.81,
+        'waypoint_y': 2.47,
+        'waypoint_reward_max': 5.0,       # 奖励上限
+        'waypoint_sigma': 5.0,            # 距离衰减参数, 超过此距离奖励为0
+        'waypoint_decay_steps': -1,       # 奖励上限递减到0的步数, -1表示=max_steps
+        # 速度方向一致性奖励 (5步内方向保持一致)
+        'consistency_window': 5,          # 方向一致性检测窗口
+        'consistency_reward': 0.1,        # 方向一致时的奖励
+        # 反向速度惩罚 (速度直接反向, 归零不惩罚)
+        'reverse_penalty': -0.05,         # 方向反向时的惩罚
+        # 时间惩罚 (每步)
+        'time_penalty': -0.01,
+        # 往更远处走惩罚 (远离目标)
+        'retreat_penalty': 0.0,
+        # 往高处走奖励 (z轴上升)
+        'climb_reward': 0.3,
+        # 往低处走惩罚 (z轴下降)
+        'descend_penalty': -0.3,
+        # 卡住时回退步数
+        'stuck_rollback_steps': 30,
+    })
+
     # 控制限制
     chassis_velocity_limit: Dict[str, float] = field(default_factory=lambda: {
-        'linear_x_max': 2.0,    # m/s
-        'linear_y_max': 2.0,    # m/s
+        'linear_x_max': 2.4,    # m/s (每步0.08m @ 30Hz)
+        'linear_y_max': 2.4,    # m/s
     })
 
     shoot_config: Dict[str, float] = field(default_factory=lambda: {

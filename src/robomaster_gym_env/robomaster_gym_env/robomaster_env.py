@@ -8,6 +8,7 @@ import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import time
 import math
+import os
 
 from .config import GymEnvConfig, DEFAULT_GYM_CONFIG
 from .ros2_interface import ROS2Interface
@@ -89,14 +90,14 @@ class RoboMasterGazeboEnv(gymnasium.Env):
 
         # 环境状态
         self.current_step = 0
-        self.max_steps = 2048  # 最大步数 (与rollout_steps一致)
+        self.max_steps = 2048  # 最大步数
         self.control_period = 1.0 / self.config.control_frequency
         self.last_control_time = 0.0
         
         # real_time_factor: 仿真加速倍数
         # 需要与 Gazebo 世界文件中的 real_time_factor 一致
-        # 3.0 表示仿真时间流速是真实时间的 3 倍
-        self.real_time_factor = 3.0
+        # 服务器 (CPU 30%): 5.0
+        self.real_time_factor = 5.0
 
         # 每步伤害（固定为10）
         self.damage_per_step = 10.0
@@ -148,6 +149,11 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         self._virtual_blue_x = self.config.virtual_blue_x
         self._virtual_blue_y = self.config.virtual_blue_y
 
+        # 可达点收集: 运行时记录机器人能到达的整数坐标
+        self._reachable_points_file = os.path.join(os.path.dirname(__file__), 'reachable_points.npy')
+        self._reachable_points = set()  # set of (int_x, int_y)
+        self._load_reachable_points()
+
         # 启动ROS2
         self.ros2_interface.start_spinning()
 
@@ -190,6 +196,17 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         # 更新步数
         self.current_step += 1
 
+        # 记录位置历史 (用于卡住时回退)
+        own_pos = self.ros2_interface.get_robot_position()
+        if own_pos is not None:
+            self._position_history.append((own_pos[0], own_pos[1], own_pos[2]))
+            # 只保留最近50步
+            if len(self._position_history) > 50:
+                self._position_history = self._position_history[-50:]
+
+        # 收集可达点: 记录机器人当前整数坐标
+        self._collect_reachable_point()
+
         # 更新环境状态信息
         self._update_env_state(action)
 
@@ -218,12 +235,24 @@ class RoboMasterGazeboEnv(gymnasium.Env):
                     reward = self.config.reward_config.get('out_of_boundary', -100.0)
                     self._last_reward = reward
 
+        # 检测仿真数据是否异常 (rtf 过低或过高)
+        # rtf 正常范围: [set_rtf * 0.8, set_rtf * 1.2]
+        # 异常时标记 info['sim_unstable'] = True, 训练循环应跳过该步
+        sim_unstable = False
+        measured_rtf = self._real_time_factor_measured
+        set_rtf = self.real_time_factor
+        if measured_rtf > 0 and set_rtf > 0:
+            rtf_ratio = measured_rtf / set_rtf
+            if rtf_ratio < 0.8 or rtf_ratio > 1.2:
+                sim_unstable = True
+
         # 额外信息
         info = {
             'current_step': self.current_step,
             'max_steps': self.max_steps,
             'curriculum_stage': self._curriculum_stage,
             'virtual_blue_pos': (self._virtual_blue_x, self._virtual_blue_y),
+            'sim_unstable': sim_unstable,
         }
 
         # 步内计时诊断 (每100步打印一次)
@@ -259,64 +288,95 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         # 温和重置: 只重置红方机器人位姿, 不重置整个仿真
         # 先确认Gazebo中模型已加载, 避免set_pose创建额外模型
         pose_info = self.ros2_interface.referee_data.get('pose_info')
+        model_exists = False
         if pose_info is not None:
             model_exists = any(
                 t.child_frame_id == self.config.robot_name or
                 t.child_frame_id == f"{self.config.robot_name}_0"
                 for t in pose_info
             )
-            if model_exists:
-                # 先发送零速度命令，清除机器人的惯性速度
-                # 否则 set_pose 只改位置不改速度，重置后机器人会带着旧速度乱飞
-                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
-                # 用 spin_once 处理回调，比 sleep 更高效
-                for _ in range(5):
-                    self.ros2_interface.spin_once()
-                    time.sleep(0.01)
-                
-                # 重置位置，z 稍微抬高确保落地
-                self.ros2_interface.set_robot_pose(3.4, 9.5, 0.35, 0.0)
-                
-                # 等待机器人落地并稳定 (缩短等待时间)
-                time.sleep(0.2)
-                
-                # 检查机器人是否稳定（速度接近零且未翻车）
-                stable_wait = 0
-                max_stable_wait = 20  # 最多等待 1 秒
-                while stable_wait < max_stable_wait:
-                    # 处理回调获取最新数据
-                    self.ros2_interface.spin_once()
-                    
-                    # 如果翻车了，重新重置位置
-                    if self.ros2_interface.is_tumbled():
-                        print("[WARN] 重置后翻车，重新重置位置")
-                        self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
-                        for _ in range(5):
-                            self.ros2_interface.spin_once()
-                            time.sleep(0.01)
-                        self.ros2_interface.set_robot_pose(3.4, 9.5, 0.35, 0.0)
-                        time.sleep(0.2)
-                        stable_wait = 0
-                        continue
-                    
-                    # 获取机器人速度（从 odom 数据）
-                    odom_data = self.ros2_interface.state_data.get('odom')
-                    if odom_data is not None and 'twist' in odom_data:
-                        twist = odom_data['twist']
-                        linear = twist.get('linear', {})
-                        angular = twist.get('angular', {})
-                        # 检查线速度和角速度是否足够小
-                        linear_vel = (linear.get('x', 0)**2 + linear.get('y', 0)**2 + linear.get('z', 0)**2)**0.5
-                        angular_vel = (angular.get('x', 0)**2 + angular.get('y', 0)**2 + angular.get('z', 0)**2)**0.5
-                        if linear_vel < 0.1 and angular_vel < 0.1:
-                            break
-                    time.sleep(0.05)
-                    stable_wait += 1
-                
-                if stable_wait >= max_stable_wait:
-                    print("[WARN] 机器人未能在规定时间内稳定，继续训练")
+
+        # 出界/翻车/死亡后, 裁判系统可能已断电(enable_power=False)
+        # 发送 START_GAME 命令恢复所有机器人的电源和控制, 否则 set_pose 后车无法移动
+        try:
+            from rmoss_interfaces.msg import RefereeCmd
+            if 'referee_cmd' in self.ros2_interface.publishers:
+                start_msg = RefereeCmd()
+                start_msg.cmd = RefereeCmd.START_GAME
+                start_msg.robot_name = ''
+                self.ros2_interface.publishers['referee_cmd'].publish(start_msg)
+                time.sleep(0.3)
+        except (ImportError, KeyError):
+            pass
+
+        # 即使 pose_info 中找不到模型(出界后可能丢失), 也尝试 set_pose
+        # Gazebo 的 set_pose service 按模型名查找, 只要模型还在世界就能设
+        if True:
+            # 先发送零速度命令，清除机器人的惯性速度
+            # 否则 set_pose 只改位置不改速度，重置后机器人会带着旧速度乱飞
+            self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+            # 等待速度归零 (最多0.5秒)
+            for _ in range(25):
+                self.ros2_interface.spin_once()
+                time.sleep(0.02)
+            
+            # 红方初始位置: 特化模式固定, 常规模式随机
+            spec_cfg = self.config.specialize_config
+            if spec_cfg.get('enabled', False):
+                reset_x = spec_cfg.get('start_x', 8.64)
+                reset_y = spec_cfg.get('start_y', 3.65)
             else:
-                print(f"[WARN] Gazebo中未找到模型{self.config.robot_name}, 跳过位姿重置")
+                reset_x, reset_y = self._sample_reset_position()
+            
+            # 重置位置，z 稍微抬高确保落地
+            self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
+            
+            # 等待机器人落地并稳定 (缩短等待时间)
+            time.sleep(0.2)
+            
+            # 检查机器人是否稳定（速度接近零且未翻车）
+            stable_wait = 0
+            max_stable_wait = 20  # 最多等待 1 秒
+            while stable_wait < max_stable_wait:
+                # 处理回调获取最新数据
+                self.ros2_interface.spin_once()
+                
+                # 如果翻车了，重新重置位置
+                if self.ros2_interface.is_tumbled():
+                    print("[WARN] 重置后翻车，重新重置位置")
+                    self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                    for _ in range(25):
+                        self.ros2_interface.spin_once()
+                        time.sleep(0.02)
+                    # 翻车重试时仍用特化位置, 不破坏训练假设
+                    if spec_cfg.get('enabled', False):
+                        reset_x = spec_cfg.get('start_x', 8.64)
+                        reset_y = spec_cfg.get('start_y', 3.65)
+                    else:
+                        reset_x, reset_y = self._sample_reset_position()
+                    self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
+                    time.sleep(0.2)
+                    stable_wait = 0
+                    continue
+                
+                # 获取机器人速度（从 odom 数据）
+                odom_data = self.ros2_interface.state_data.get('odom')
+                if odom_data is not None and 'twist' in odom_data:
+                    twist = odom_data['twist']
+                    linear = twist.get('linear', {})
+                    angular = twist.get('angular', {})
+                    # 检查线速度和角速度是否足够小
+                    linear_vel = (linear.get('x', 0)**2 + linear.get('y', 0)**2 + linear.get('z', 0)**2)**0.5
+                    angular_vel = (angular.get('x', 0)**2 + angular.get('y', 0)**2 + angular.get('z', 0)**2)**0.5
+                    if linear_vel < 0.1 and angular_vel < 0.1:
+                        break
+                time.sleep(0.05)
+                stable_wait += 1
+            
+            if stable_wait >= max_stable_wait:
+                print("[WARN] 机器人未能在规定时间内稳定，继续训练")
+        else:
+            print(f"[WARN] Gazebo中未找到模型{self.config.robot_name}, 跳过位姿重置")
 
         # 重置环境: 只重置内部状态, 不发任何Gazebo命令
         # 使用虚拟蓝方位置进行课程学习(不移动Gazebo中的蓝方)
@@ -341,6 +401,11 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         self.coin_revive_count = 0  # 重置金币复活次数
         self.revive_waiting_steps = 0  # 重置复活等待步数
         self.is_dead = False  # 重置死亡状态
+        self._speed_history = []  # 重置卡住检测历史
+        self._spec_last_dist = None  # 重置特化模式距离历史
+        self._spec_last_z = None  # 重置特化模式高度历史
+        self._position_history = []  # 重置位置历史
+        self._vel_dir_history = []  # 重置速度方向历史
 
         # 重置奖励计算器
         self.reward_calculator.reset()
@@ -402,6 +467,11 @@ class RoboMasterGazeboEnv(gymnasium.Env):
 
     def close(self):
         """关闭环境"""
+        # 保存可达点
+        self._save_reachable_points()
+        if len(self._reachable_points) > 0:
+            print(f"[INFO] 保存 {len(self._reachable_points)} 个可达点")
+
         if self.ros2_interface is not None:
             self.ros2_interface.stop_spinning()
             self.ros2_interface.destroy()
@@ -442,20 +512,181 @@ class RoboMasterGazeboEnv(gymnasium.Env):
     def _execute_action(self, action: Dict[str, np.ndarray]):
         """执行动作
 
-        云台已锁定（fixed joint），底盘角度通过 follow_yaw 模式保持不动。
+        云台不控制, 保持不动。
+        底盘用 FOLLOW_GIMBAL 模式, 平缓跟随云台。
         """
-        # 底盘控制 (angular_z 固定为0，不作为动作)
+        # 底盘: FOLLOW_GIMBAL 模式
         if 'chassis_velocity' in action:
-            self.ros2_interface.send_chassis_velocity(
+            self.ros2_interface.send_chassis_follow_gimbal(
                 linear_x=action['chassis_velocity'][0],
                 linear_y=action['chassis_velocity'][1],
-                angular_z=0.0
             )
 
         # 射击控制
         if 'shoot' in action:
             shoot_mode = int(action['shoot'])
             self.ros2_interface.send_shoot_command(projectile_num=shoot_mode)
+
+    def _check_stuck(self, threshold: float = 0.05, window: int = 30) -> bool:
+        """检测底盘是否卡住
+
+        当最近 window 步中, 底盘实际速度持续低于 threshold, 判定为卡住。
+
+        Args:
+            threshold: 速度阈值 (m/s), 低于此值视为静止
+            window: 检测窗口 (步数)
+
+        Returns:
+            bool: True 表示卡住
+        """
+        odom = self.ros2_interface.get_odom()
+        if odom is None:
+            return False
+
+        actual_speed = np.sqrt(
+            odom.get('linear_x', 0)**2 + odom.get('linear_y', 0)**2
+        )
+
+        # 维护速度历史
+        if not hasattr(self, '_speed_history'):
+            self._speed_history = []
+        self._speed_history.append(actual_speed)
+        if len(self._speed_history) > window:
+            self._speed_history = self._speed_history[-window:]
+
+        # 窗口内速度都低于阈值 → 卡住
+        if len(self._speed_history) >= window:
+            return all(s < threshold for s in self._speed_history)
+        return False
+
+    def _calculate_specialize_reward(self, spec_cfg: Dict) -> float:
+        """特化模式奖励计算
+
+        规则:
+        - 靠近目标2m内: 有奖励 (原有逻辑)
+        - 中间奖励点: 距离越近奖励越高, 上限随时间递减
+        - 速度方向一致性: 5步内方向保持一致有奖励
+        - 反向速度惩罚: 速度直接反向给小惩罚, 归零不惩罚
+        - 时间推移: 有惩罚
+        - 往更远处走: 有惩罚
+        - 往高处走: 有奖励
+        - 往低处走: 有惩罚
+        - 碰墙: 有惩罚
+        """
+        reward = 0.0
+
+        # 获取当前位置
+        own_position = self.ros2_interface.get_robot_position()
+        if own_position is None:
+            return 0.0
+        own_x, own_y, own_z = own_position
+
+        target_x = spec_cfg.get('target_x', 14.0)
+        target_y = spec_cfg.get('target_y', 7.5)
+
+        # 计算到目标的水平距离
+        dist_to_target = np.sqrt((own_x - target_x)**2 + (own_y - target_y)**2)
+
+        # 1. 靠近目标奖励: 2m内才有 (原有逻辑)
+        approach_radius = spec_cfg.get('approach_radius', 2.0)
+        approach_reward = spec_cfg.get('approach_reward', 1.0)
+        if dist_to_target <= approach_radius:
+            reward += approach_reward * (1.0 - dist_to_target / approach_radius)
+
+        # 2. 中间奖励点: 距离越近奖励越高, 上限随时间递减
+        #    reward = max_reward * (1 - dist/sigma) * decay(t)
+        waypoint_x = spec_cfg.get('waypoint_x', 4.81)
+        waypoint_y = spec_cfg.get('waypoint_y', 2.47)
+        dist_to_waypoint = np.sqrt((own_x - waypoint_x)**2 + (own_y - waypoint_y)**2)
+        waypoint_reward_max = spec_cfg.get('waypoint_reward_max', 2.0)
+        waypoint_sigma = spec_cfg.get('waypoint_sigma', 5.0)
+        waypoint_decay_steps = spec_cfg.get('waypoint_decay_steps', -1)
+        if waypoint_decay_steps == -1:
+            waypoint_decay_steps = self.max_steps
+        if dist_to_waypoint < waypoint_sigma:
+            wp_proximity = 1.0 - dist_to_waypoint / waypoint_sigma  # [0, 1]
+        else:
+            wp_proximity = 0.0
+        wp_progress = min(self.current_step / max(waypoint_decay_steps, 1), 1.0)
+        wp_time_decay = 1.0 - wp_progress
+        reward += waypoint_reward_max * wp_proximity * wp_time_decay
+
+        # 3. 速度方向一致性奖励 + 反向速度惩罚
+        odom = self.ros2_interface.get_odom()
+        if odom is not None:
+            vx = odom.get('linear_x', 0.0)
+            vy = odom.get('linear_y', 0.0)
+            speed = np.sqrt(vx**2 + vy**2)
+            if speed > 0.05:
+                direction = np.array([vx / speed, vy / speed])
+            else:
+                direction = None  # 速度归零, 不算方向
+
+            self._vel_dir_history.append(direction)
+            if len(self._vel_dir_history) > 5:
+                self._vel_dir_history = self._vel_dir_history[-5:]
+
+            consistency_reward = spec_cfg.get('consistency_reward', 0.1)
+            reverse_penalty = spec_cfg.get('reverse_penalty', -0.05)
+
+            valid_dirs = [d for d in self._vel_dir_history if d is not None]
+            if len(valid_dirs) >= 2:
+                d_prev = valid_dirs[-2]
+                d_curr = valid_dirs[-1]
+                dot = np.dot(d_prev, d_curr)  # [-1, 1]
+
+                if dot > 0:
+                    # 方向一致 (夹角<90°), 给奖励
+                    reward += consistency_reward * dot
+                elif dot < 0:
+                    # 方向反向 (夹角>90°), 给惩罚
+                    reward += reverse_penalty * abs(dot)
+
+        # 4. 时间惩罚: 每步都有, 但低于接近奖励
+        time_penalty = spec_cfg.get('time_penalty', -0.01)
+        reward += time_penalty
+
+        # 5. 远离目标惩罚: 距离增大时惩罚
+        retreat_penalty = spec_cfg.get('retreat_penalty', -0.5)
+        if self._spec_last_dist is None:
+            self._spec_last_dist = dist_to_target
+        dist_delta = dist_to_target - self._spec_last_dist  # 正值=远离
+        if dist_delta > 0:
+            reward += retreat_penalty * dist_delta
+        self._spec_last_dist = dist_to_target
+
+        # 5. 高度变化奖励/惩罚
+        climb_reward = spec_cfg.get('climb_reward', 0.3)
+        descend_penalty = spec_cfg.get('descend_penalty', -0.3)
+        if self._spec_last_z is None:
+            self._spec_last_z = own_z
+        z_delta = own_z - self._spec_last_z  # 正值=上升
+        if z_delta > 0:
+            reward += climb_reward * z_delta
+        elif z_delta < 0:
+            reward += descend_penalty * abs(z_delta)
+        self._spec_last_z = own_z
+
+        # 6. 翻车惩罚
+        if self.ros2_interface.is_tumbled():
+            reward += self.config.reward_config.get('tumble', -10.0)
+
+        # 7. 碰墙惩罚 + 回退到30步前位置
+        if self._check_stuck():
+            reward += self.config.reward_config.get('stuck_penalty', -1.0)
+            rollback_steps = spec_cfg.get('stuck_rollback_steps', 30)
+            if len(self._position_history) >= rollback_steps:
+                old_x, old_y, old_z = self._position_history[-rollback_steps]
+                # 先清零速度, 否则 set_pose 后带着旧速度漂移
+                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                for _ in range(5):
+                    self.ros2_interface.spin_once()
+                    time.sleep(0.01)
+                self.ros2_interface.set_robot_pose(old_x, old_y, 0.28, 0.0)
+                self._spec_last_dist = None
+                self._spec_last_z = None
+
+        return reward
 
     def _get_enemy_outpost_position(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """获取敌方前哨站位置
@@ -547,8 +778,61 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         except Exception:
             pass
 
+    def _load_reachable_points(self):
+        """从文件加载已保存的可达点"""
+        try:
+            if os.path.exists(self._reachable_points_file):
+                arr = np.load(self._reachable_points_file)
+                self._reachable_points = set(map(tuple, arr.astype(int).tolist()))
+                print(f"[INFO] 加载 {len(self._reachable_points)} 个可达点")
+        except Exception as e:
+            print(f"[WARN] 加载可达点失败: {e}")
+            self._reachable_points = set()
+
+    def _save_reachable_points(self):
+        """保存可达点到文件"""
+        try:
+            if self._reachable_points:
+                arr = np.array(list(self._reachable_points), dtype=int)
+                np.save(self._reachable_points_file, arr)
+        except Exception as e:
+            print(f"[WARN] 保存可达点失败: {e}")
+
+    def _collect_reachable_point(self):
+        """收集当前机器人位置的整数坐标作为可达点"""
+        try:
+            pos = self.ros2_interface.get_robot_position()
+            if pos is not None:
+                ix, iy = int(round(pos[0])), int(round(pos[1]))
+                if (ix, iy) not in self._reachable_points:
+                    self._reachable_points.add((ix, iy))
+                    # 每100个新点保存一次
+                    if len(self._reachable_points) % 100 == 0:
+                        self._save_reachable_points()
+        except Exception:
+            pass
+
+    def _sample_reset_position(self):
+        """采样 reset 位置: 优先从可达点选取, 否则回退到均匀随机"""
+        if len(self._reachable_points) >= 10:
+            ix, iy = list(self._reachable_points)[np.random.randint(len(self._reachable_points))]
+            # 整数坐标上加小随机偏移, 避免每次都精确在同一位置
+            reset_x = ix + np.random.uniform(-0.3, 0.3)
+            reset_y = iy + np.random.uniform(-0.3, 0.3)
+            return reset_x, reset_y
+        else:
+            # 可达点不足, 回退到均匀随机
+            reset_x = np.random.uniform(2.0, 12.0)
+            reset_y = np.random.uniform(2.0, 13.0)
+            return reset_x, reset_y
+
     def _calculate_reward(self) -> float:
         """计算奖励"""
+        # 特化模式: 使用专用奖励逻辑, 原奖励不生效
+        spec_cfg = self.config.specialize_config
+        if spec_cfg.get('enabled', False):
+            return self._calculate_specialize_reward(spec_cfg)
+
         # 从ROS2获取当前状态
         robot_status = self.ros2_interface.get_robot_status()
         referee_data = self.ros2_interface.get_referee_data()
@@ -579,6 +863,7 @@ class RoboMasterGazeboEnv(gymnasium.Env):
 
         # 计算虚拟蓝方距离(红方当前位置到虚拟蓝方位置的距离)
         virtual_blue_distance = None
+        direction_alignment = None  # 方向跟随: 速度在目标方向上的投影
         curriculum = self.config.curriculum_config
         if curriculum.get('enabled', False) and curriculum.get('use_virtual_blue', True):
             own_position = self.ros2_interface.get_robot_position()
@@ -589,8 +874,25 @@ class RoboMasterGazeboEnv(gymnasium.Env):
                     (self._virtual_blue_y - own_y) ** 2
                 )
 
+                # 计算方向跟随: 当前速度在目标方向上的投影
+                # 目标方向 = (蓝方 - 红方) / 距离
+                if virtual_blue_distance > 0.1:
+                    target_dx = (self._virtual_blue_x - own_x) / virtual_blue_distance
+                    target_dy = (self._virtual_blue_y - own_y) / virtual_blue_distance
+                    # 从 odom 获取当前速度
+                    odom_data = self.ros2_interface.state_data.get('odom')
+                    if odom_data is not None and 'twist' in odom_data:
+                        twist = odom_data['twist']
+                        linear = twist.get('linear', {})
+                        vx = linear.get('x', 0.0)
+                        vy = linear.get('y', 0.0)
+                        # 速度在目标方向上的投影 (归一化到 [-1, 1])
+                        speed = np.sqrt(vx**2 + vy**2)
+                        if speed > 0.01:
+                            direction_alignment = (vx * target_dx + vy * target_dy) / speed
+
         # 计算奖励
-        return self.reward_calculator.calculate_reward(
+        reward = self.reward_calculator.calculate_reward(
             current_hp=current_hp,
             current_ammo=current_ammo,
             attack_info=attack_info,
@@ -599,7 +901,14 @@ class RoboMasterGazeboEnv(gymnasium.Env):
             nearest_enemy_distance=nearest_enemy_distance,
             max_field_distance=max_field_distance,
             virtual_blue_distance=virtual_blue_distance,
+            direction_alignment=direction_alignment,
         )
+
+        # 碰墙惩罚: 底盘卡住时给惩罚, 让网络学会避墙
+        if self._check_stuck():
+            reward += self.config.reward_config.get('stuck_penalty', -1.0)
+
+        return reward
 
     def _count_nearby_enemies(self, distance_threshold: float = 4.0) -> int:
         """计算指定距离范围内的敌方机器人数量
@@ -692,6 +1001,13 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         存储在 self._virtual_blue_x/y 中, 仅用于奖励计算,
         不实际移动 Gazebo 中的蓝方机器人。
         """
+        # 特化模式下使用固定目标位置
+        spec_cfg = self.config.specialize_config
+        if spec_cfg.get('enabled', False):
+            self._virtual_blue_x = spec_cfg.get('target_x', 14.0)
+            self._virtual_blue_y = spec_cfg.get('target_y', 7.5)
+            return
+
         curriculum = self.config.curriculum_config
         if not curriculum.get('enabled', False) or not curriculum.get('use_virtual_blue', True):
             # 课程学习未启用, 使用默认蓝方位置
@@ -702,8 +1018,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         # 获取红方实际位置 (从pose_info读取)
         red_x, red_y = self._get_own_position_safe()
         if red_x is None:
-            # 回退到默认位置
-            red_x, red_y = 3.4, 9.5
+            # 回退到场地中心
+            red_x, red_y = 7.0, 7.5
 
         # 获取当前阶段的距离范围
         stage = self._curriculum_stage
@@ -735,8 +1051,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         # 获取红方实际位置 (从pose_info读取)
         red_x, red_y = self._get_own_position_safe()
         if red_x is None:
-            # 回退到默认位置
-            red_x, red_y = 3.4, 9.5
+            # 回退到场地中心
+            red_x, red_y = 7.0, 7.5
 
         # 获取当前阶段的距离范围
         stage = self._curriculum_stage
@@ -781,7 +1097,7 @@ class RoboMasterGazeboEnv(gymnasium.Env):
 
         if self._curriculum_episode_count >= max_episodes:
             next_stage = stage + 1
-            max_stage = max(curriculum.get('stage_ranges', {}).keys(), 4)
+            max_stage = max(list(curriculum.get('stage_ranges', {}).keys()) + [4])
             if next_stage <= max_stage:
                 self._curriculum_stage = next_stage
                 self._curriculum_episode_count = 0

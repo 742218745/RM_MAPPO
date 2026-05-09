@@ -36,7 +36,7 @@ class ObservationConfig:
         max_hp: 最大血量 (默认400)
         max_ammo: 最大弹药量 (默认300)
         max_economy: 最大经济值 (默认400)
-        max_steps: 最大步数 (默认2100)
+        max_steps: 最大步数 (默认2048)
         max_countdown_steps: 最大判负步数 (默认10500, 1秒=5步)
         max_outpost_hp: 前哨站最大血量 (默认1500)
         max_base_hp: 基地最大血量 (默认5000)
@@ -49,8 +49,8 @@ class ObservationConfig:
     max_hp: int = 400
     max_ammo: int = 300
     max_economy: int = 400
-    max_steps: int = 2100
-    max_countdown_steps: int = 2100
+    max_steps: int = 2048
+    max_countdown_steps: int = 2048
     max_outpost_hp: int = 1500
     max_base_hp: int = 5000
     damage_per_step: int = 10
@@ -144,6 +144,16 @@ class ObservationSpace:
             # True: 已展开, False: 未展开
             'base_exposed': spaces.Discrete(2),
 
+            # 目标相对方向: [dx, dy] (归一化到[-1,1])
+            # 从自身位置指向最近敌方/虚拟蓝方的方向向量
+            # unknown时: [0, 0]
+            'target_direction': spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(2,),
+                dtype=np.float32
+            ),
+
             # 每步攻击消耗弹药量
             # unknown时: -1
             'ammo_consumed_per_step': spaces.Discrete(self.config.max_ammo + 1),
@@ -173,7 +183,8 @@ class ObservationSpace:
             'base_hp': UnknownStateHandler.UNKNOWN_INT,
             'base_exposed': 0,
             'ammo_consumed_per_step': UnknownStateHandler.UNKNOWN_INT,
-            'revive_waiting_steps': UnknownStateHandler.UNKNOWN_INT
+            'revive_waiting_steps': UnknownStateHandler.UNKNOWN_INT,
+            'target_direction': np.array([0.0, 0.0], dtype=np.float32),
         }
 
     def is_valid(self, observation: Dict[str, np.ndarray]) -> bool:
@@ -189,7 +200,8 @@ class ObservationSpace:
         required_keys = [
             'all_robots', 'own_hp', 'own_ammo',
             'team_economy', 'remaining_steps', 'judge_countdown_steps', 'damage_per_step',
-            'outpost_hp', 'base_hp', 'base_exposed', 'ammo_consumed_per_step', 'revive_waiting_steps'
+            'outpost_hp', 'base_hp', 'base_exposed', 'ammo_consumed_per_step',
+            'revive_waiting_steps', 'target_direction'
         ]
 
         for key in required_keys:
@@ -218,7 +230,8 @@ class ObservationSpace:
         base_hp: int,
         base_exposed: bool,
         ammo_consumed_per_step: int,
-        revive_waiting_steps: int
+        revive_waiting_steps: int,
+        target_direction: np.ndarray = None,
     ) -> Dict[str, Any]:
         """构建观察字典
 
@@ -235,10 +248,14 @@ class ObservationSpace:
             base_exposed: 基地展开状态
             ammo_consumed_per_step: 每步攻击消耗弹药量
             revive_waiting_steps: 复活等待步数
+            target_direction: 目标相对方向 [dx, dy] 归一化到[-1,1]
 
         Returns:
             Dict[str, Any]: 观察字典
         """
+        if target_direction is None:
+            target_direction = np.array([0.0, 0.0], dtype=np.float32)
+
         observation = {
             'all_robots': all_robots,
             'own_hp': own_hp,
@@ -251,7 +268,8 @@ class ObservationSpace:
             'base_hp': base_hp,
             'base_exposed': 1 if base_exposed else 0,
             'ammo_consumed_per_step': ammo_consumed_per_step,
-            'revive_waiting_steps': revive_waiting_steps
+            'revive_waiting_steps': revive_waiting_steps,
+            'target_direction': target_direction,
         }
 
         return observation
@@ -358,7 +376,12 @@ class ObservationSpace:
             judge_countdown_seconds = game_state['judge_countdown']
             judge_countdown_steps = judge_countdown_seconds * 5 if judge_countdown_seconds > 0 else 0
 
-        # 10. 构建观察字典
+        # 10. 计算目标相对方向
+        target_direction = self._compute_target_direction(
+            all_robots, virtual_blue_pos
+        )
+
+        # 11. 构建观察字典
         observation = self.get_observation(
             all_robots=all_robots,
             own_hp=own_hp,
@@ -371,7 +394,8 @@ class ObservationSpace:
             base_hp=base_hp,
             base_exposed=base_exposed,
             ammo_consumed_per_step=ammo_consumed,
-            revive_waiting_steps=env_revive_waiting_steps if env_revive_waiting_steps is not None else 0
+            revive_waiting_steps=env_revive_waiting_steps if env_revive_waiting_steps is not None else 0,
+            target_direction=target_direction,
         )
 
         return observation
@@ -487,3 +511,60 @@ class ObservationSpace:
             return self.config.max_ammo
 
         return int(ammo_consumed_per_step)
+
+    def _compute_target_direction(
+        self,
+        all_robots: np.ndarray,
+        virtual_blue_pos: Optional[Tuple[float, float]] = None,
+    ) -> np.ndarray:
+        """计算从自身指向目标的方向向量 (归一化到[-1,1])
+
+        优先使用虚拟蓝方位置, 否则找 all_robots 中最近的敌方。
+        方向向量按场地尺寸归一化: dx/14, dy/7.5
+
+        Args:
+            all_robots: (10, 4) [id, team, x, y]
+            virtual_blue_pos: 虚拟蓝方位置 (x, y)
+
+        Returns:
+            np.ndarray: (2,) [dx_norm, dy_norm]
+        """
+        # 找自身位置 (team=0 的第一个)
+        own_x, own_y = None, None
+        for i in range(all_robots.shape[0]):
+            if int(all_robots[i, 1]) == 0:  # ally
+                own_x = all_robots[i, 2]
+                own_y = all_robots[i, 3]
+                break
+
+        if own_x is None:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        # 确定目标位置
+        target_x, target_y = None, None
+
+        if virtual_blue_pos is not None:
+            target_x, target_y = virtual_blue_pos
+        else:
+            # 找最近的敌方 (team=1)
+            min_dist = float('inf')
+            for i in range(all_robots.shape[0]):
+                if int(all_robots[i, 1]) == 1:  # enemy
+                    ex, ey = all_robots[i, 2], all_robots[i, 3]
+                    dist = (ex - own_x) ** 2 + (ey - own_y) ** 2
+                    if dist < min_dist:
+                        min_dist = dist
+                        target_x, target_y = ex, ey
+
+        if target_x is None:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        # 计算方向并归一化
+        dx = (target_x - own_x) / 14.0   # 场地半宽
+        dy = (target_y - own_y) / 7.5    # 场地半高
+
+        # clip 到 [-1, 1]
+        dx = float(np.clip(dx, -1.0, 1.0))
+        dy = float(np.clip(dy, -1.0, 1.0))
+
+        return np.array([dx, dy], dtype=np.float32)

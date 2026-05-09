@@ -82,7 +82,7 @@ class StateEncoder(nn.Module):
     输入: 11维归一化标量特征
     输出: embed_dim 维向量
     """
-    def __init__(self, input_dim=11, embed_dim=64):
+    def __init__(self, input_dim=13, embed_dim=64):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, 64),
@@ -218,7 +218,7 @@ class MAPPOActor(nn.Module):
 
         # ===== 编码器 =====
         self.robot_encoder = RobotEncoder(input_dim=4, embed_dim=robot_embed_dim)
-        self.state_encoder = StateEncoder(input_dim=11, embed_dim=state_embed_dim)
+        self.state_encoder = StateEncoder(input_dim=13, embed_dim=state_embed_dim)
 
         # ===== 融合层 =====
         fusion_input = robot_embed_dim + state_embed_dim

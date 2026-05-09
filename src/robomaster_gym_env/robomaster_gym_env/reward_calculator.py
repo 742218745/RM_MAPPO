@@ -37,6 +37,7 @@ class RewardCalculator:
         nearest_enemy_distance: float = float('inf'),
         max_field_distance: float = 30.0,
         virtual_blue_distance: float = None,
+        direction_alignment: float = None,
     ) -> float:
         """
         计算当前步的奖励
@@ -50,6 +51,7 @@ class RewardCalculator:
             nearest_enemy_distance: 最近敌方机器人的距离(米)
             max_field_distance: 场地最大距离(用于归一化)
             virtual_blue_distance: 虚拟蓝方距离(米), 若提供则替代nearest_enemy_distance用于距离奖励
+            direction_alignment: 速度在目标方向上的投影 [-1,1], 正值=朝目标走, 负值=背离
 
         Returns:
             float: 奖励值

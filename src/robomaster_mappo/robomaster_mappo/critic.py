@@ -49,7 +49,7 @@ class MAPPOCritic(nn.Module):
 
         # ===== 编码器 (与 Actor 共享结构, 但不共享权重) =====
         self.robot_encoder = RobotEncoder(input_dim=4, embed_dim=robot_embed_dim)
-        self.state_encoder = StateEncoder(input_dim=11, embed_dim=state_embed_dim)
+        self.state_encoder = StateEncoder(input_dim=13, embed_dim=state_embed_dim)
 
         # ===== 融合层 =====
         fusion_input = robot_embed_dim + state_embed_dim

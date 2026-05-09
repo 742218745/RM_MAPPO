@@ -9,6 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 import threading
+import math
 import time
 from typing import Dict, Any, Optional, Callable, Tuple
 import numpy as np
@@ -670,6 +671,27 @@ class ROS2Interface:
         msg.angular.z = float(angular_z)
         self.publishers['cmd_vel'].publish(msg)
 
+    def send_chassis_follow_gimbal(self, linear_x: float, linear_y: float):
+        """发送底盘跟随云台模式的速度命令
+
+        FOLLOW_GIMBAL 模式下, 底盘 PID 自动跟随云台朝向,
+        速度在云台坐标系下直接透传 (不做旋转)。
+        云台锁定 yaw=0 时, 速度就是世界坐标系, 底盘也自动回正。
+
+        Args:
+            linear_x: 云台坐标系前进速度 (m/s)
+            linear_y: 云台坐标系横向速度 (m/s)
+        """
+        msg = ChassisCmd()
+        msg.type = msg.FOLLOW_GIMBAL  # type=2
+        msg.twist.linear.x = float(linear_x)
+        msg.twist.linear.y = float(linear_y)
+        msg.twist.linear.z = 0.0
+        msg.twist.angular.x = 0.0
+        msg.twist.angular.y = 0.0
+        msg.twist.angular.z = 0.0
+        self.publishers['chassis_cmd'].publish(msg)
+
     def send_gimbal_angle(self, yaw: float, pitch: float, yaw_type: int = 1, pitch_type: int = 1):
         """
         发送云台角度命令
@@ -911,6 +933,23 @@ class ROS2Interface:
 
         # 无法获取，返回(0, 0, 0)
         return 0.0, 0.0, 0.0
+
+    def get_robot_yaw(self) -> float:
+        """获取底盘在世界坐标系下的 yaw 角度 (弧度)
+
+        Returns:
+            float: yaw 角度，无法获取返回 0.0
+        """
+        for key in ['chassis_odometry_gt', 'odom']:
+            if key in self.state_data:
+                odom = self.state_data[key]
+                orientation = odom['pose']['orientation']  # [x, y, z, w]
+                x, y, z, w = orientation
+                # 四元数转 yaw
+                siny_cosp = 2.0 * (w * z + x * y)
+                cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                return math.atan2(siny_cosp, cosy_cosp)
+        return 0.0
 
     # ==================== 生命周期管理 ====================
 

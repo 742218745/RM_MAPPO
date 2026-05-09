@@ -226,7 +226,7 @@ class PPOUpdater:
         clip_epsilon: float = 0.2,
         ppo_epochs: int = 10,
         minibatch_size: int = 64,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 0.05,
         value_loss_coef: float = 0.5,
         max_grad_norm: float = 0.5,
     ):
@@ -401,7 +401,7 @@ def train(
     # ---- 环境参数 ----
     num_episodes: int = 1000,       # 训练的总回合数
     rollout_steps: int = 2048,      # 每次收集经验的步数
-    max_steps_per_episode: int = 2100,  # 每个回合最大步数
+    max_steps_per_episode: int = 2048,  # 每个回合最大步数
     render: bool = False,           # 是否渲染 (训练时通常关闭以加速)
     render_interval: int = 50,      # 每隔多少回合渲染一次
 
@@ -412,7 +412,7 @@ def train(
     clip_epsilon: float = 0.2,      # PPO 裁剪范围
     ppo_epochs: int = 10,           # 每批数据更新轮数
     minibatch_size: int = 64,       # 小批量大小
-    entropy_coef: float = 0.01,     # 熵正则化系数
+    entropy_coef: float = 0.05,     # 熵正则化系数
     value_loss_coef: float = 0.5,   # 价值损失系数
     max_grad_norm: float = 0.5,     # 梯度裁剪范数
 
@@ -440,6 +440,9 @@ def train(
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[Train] 使用设备: {device}")
+    if device == 'cpu':
+        print(f"[Train] 提示: 未检测到 GPU, 使用 CPU 推理 (~20ms/步 vs GPU ~5ms/步)")
+        print(f"[Train]       训练速度约为 GPU 的 1/3, 建议使用 GPU 实例加速")
 
     # ---- 创建检查点目录 ----
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -562,6 +565,18 @@ def train(
             next_obs, reward, terminated, truncated, info = env.step(action)
             _t2 = time.time()
             done = terminated or truncated
+
+            # 仿真不稳定时: 丢弃该步数据, 继续控制
+            # (车不动时rtf≈0, 开局rtf=0, 等恢复会死等, 所以不等)
+            if info.get('sim_unstable', False):
+                obs = next_obs
+                if done:
+                    obs, info = env.reset()
+                    episode_rewards.append(episode_reward)
+                    episode_lengths.append(episode_step)
+                    episode_reward = 0.0
+                    episode_step = 0
+                continue
 
             # 存入缓冲区
             buffer.add(
@@ -856,8 +871,8 @@ def parse_args():
                         help='每批数据更新轮数 (默认: 10)')
     parser.add_argument('--minibatch_size', type=int, default=64,
                         help='小批量大小 (默认: 64)')
-    parser.add_argument('--entropy_coef', type=float, default=0.01,
-                        help='熵正则化系数 (默认: 0.01)')
+    parser.add_argument('--entropy_coef', type=float, default=0.05,
+                        help='熵正则化系数 (默认: 0.05)')
 
     # 其他参数
     parser.add_argument('--save_interval', type=int, default=100,

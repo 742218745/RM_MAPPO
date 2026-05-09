@@ -85,6 +85,11 @@ def preprocess_obs(obs: Dict[str, np.ndarray], device: str = 'cpu'):
         float(obs['revive_waiting_steps']) / OBS_MAX['revive_waiting_steps'],
     ]
 
+    # 目标相对方向 (已在observation_space中归一化到[-1,1], 直接使用)
+    target_dir = obs.get('target_direction', np.array([0.0, 0.0]))
+    scalar_values.append(float(target_dir[0]))
+    scalar_values.append(float(target_dir[1]))
+
     state_tensor = torch.FloatTensor(scalar_values).to(device)  # (11,)
 
     return robot_tensor, state_tensor
