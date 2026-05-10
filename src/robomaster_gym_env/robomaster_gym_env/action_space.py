@@ -21,24 +21,21 @@ class ActionSpace:
             config: 动作配置字典,包含控制限制等
         """
         self.config = config
+        
+        # 离散速度等级映射表
+        self.velocity_levels = [-2.0, -1.0, 0.0, 1.0, 2.0]
+        
         self.action_space = self._build_action_space()
 
     def _build_action_space(self) -> spaces.Dict:
-        """构建动作空间"""
+        """构建动作空间 - 使用离散速度空间"""
         action_spaces = {}
 
-        # 1. 底盘速度控制
+        # 1. 底盘速度控制 - 改为离散空间
         if self.config.get('chassis_velocity', False):
-            # [linear_x, linear_y] (angular_z 固定为0，不作为动作)
-            linear_x_max = self.config.get('linear_x_max', 2.0)
-            linear_y_max = self.config.get('linear_y_max', 2.0)
-
-            action_spaces['chassis_velocity'] = spaces.Box(
-                low=np.array([-linear_x_max, -linear_y_max]),
-                high=np.array([linear_x_max, linear_y_max]),
-                shape=(2,),
-                dtype=np.float32
-            )
+            # 离散速度等级: [-2, -1, 0, 1, 2] m/s
+            # MultiDiscrete([5, 5]) 表示两个维度,每个维度0-4
+            action_spaces['chassis_velocity'] = spaces.MultiDiscrete([5, 5])
 
         # 2. 射击控制
         if self.config.get('shoot', False):
@@ -74,12 +71,15 @@ class ActionSpace:
         """
         commands = {}
 
-        # 1. 底盘速度 (angular_z 固定为0，不作为动作)
+        # 1. 底盘速度 - 从离散索引映射到实际速度
         if 'chassis_velocity' in action:
-            vel = action['chassis_velocity']
+            vel_idx = action['chassis_velocity']  # [idx_x, idx_y], 每个在0-4之间
+            linear_x = self.velocity_levels[int(vel_idx[0])]
+            linear_y = self.velocity_levels[int(vel_idx[1])]
+            
             commands['chassis'] = {
-                'linear_x': float(vel[0]),
-                'linear_y': float(vel[1]),
+                'linear_x': linear_x,
+                'linear_y': linear_y,
                 'angular_z': 0.0
             }
 

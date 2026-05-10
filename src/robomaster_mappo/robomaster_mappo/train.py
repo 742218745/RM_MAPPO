@@ -592,8 +592,8 @@ def train(
             episode_reward += reward
             episode_step += 1
 
-            # 终端实时进度 (每100步打印一行)
-            if step % 100 == 0 or done:
+            # 终端实时进度 (每500步打印一行)
+            if step % 500 == 0 or done:
                 own_x, own_y = env._get_own_position_safe()
                 if own_x is not None:
                     dist_to_target = np.sqrt(

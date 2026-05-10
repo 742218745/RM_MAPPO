@@ -3,6 +3,9 @@ build/
 install/
 log/
 
+# Training checkpoints
+checkpoints_nav_train/
+
 # Training logs
 train_log.txt
 
@@ -14,3 +17,10 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Numpy binary
+*.npy

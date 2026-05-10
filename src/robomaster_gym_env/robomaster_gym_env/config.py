@@ -36,7 +36,7 @@ class GymEnvConfig:
         'survive_per_step': 0.01,
         # 弹药惩罚
         'ammo_usage': -0.1,
-        'out_of_boundary': -100.0,
+        'out_of_boundary': -20.0,  # 出界惩罚 100→20, 避免压过到达奖励
         # 翻车惩罚 (翻车时 terminated=True, 奖励覆盖为此值)
         'tumble': -10.0,
         # 碰墙惩罚 (底盘卡住时每步惩罚)
@@ -96,26 +96,26 @@ class GymEnvConfig:
         # 中间点坐标 (必须经过的坡道点)
         'waypoint_x': 4.81,
         'waypoint_y': 2.47,
-        'waypoint_arrive_radius': 1.5,    # 到达中间点的判定半径(m)
-        'waypoint_arrive_reward': 10.0,   # 到达中间点的奖励
-        'waypoint_shaping_weight': 3.0,   # 阶段1: 距离塑形权重(靠近中间点)
+        'waypoint_arrive_radius': 1.0,    # 到达中间点的判定半径(m)
+        'waypoint_arrive_reward': 50.0,   # 到达中间点的奖励 10.0→50.0
+        'waypoint_shaping_weight': 2.5,   # 阶段1: 距离塑形权重(靠近中间点) 3.0→2.5
         # 目标到达奖励
         'approach_radius': 2.0,           # 到达目标的判定半径(m)
-        'approach_reward': 10.0,          # 到达目标的奖励
-        'target_shaping_weight': 3.0,     # 阶段2: 距离塑形权重(靠近目标)
+        'approach_reward': 50.0,          # 到达目标的奖励 10.0→50.0
+        'target_shaping_weight': 4.0,     # 阶段2: 距离塑形权重(靠近目标) 2.5→4.0
         # 爬坡奖励 (阶段1: 上坡段, 强化)
-        'climb_reward': 1.0,              # 阶段1: z轴上升奖励
-        'descend_penalty': -0.5,          # 阶段1: z轴下降惩罚
+        'climb_reward': 3.0,              # 阶段1: z轴上升奖励 1.0→3.0
+        'descend_penalty': -1.5,          # 阶段1: z轴下降惩罚 -0.5→-1.5
         # 爬坡奖励 (阶段2: 下坡/平地段, 弱化)
         'climb_reward_phase2': 0.1,       # 阶段2: z轴上升奖励(弱)
         'descend_penalty_phase2': -1.0,   # 阶段2: z轴下降惩罚(强, 防止掉回坡下)
         # 速度方向与目标方向一致性
-        'direction_reward': 1.0,          # 速度朝目标方向投影的奖励
+        'direction_reward': 2.0,          # 速度朝目标方向投影的奖励 1.0→2.0
         # 速度大小奖励 (鼓励快速移动)
-        'speed_reward': 0.2,              # 阶段1: 速度大小奖励
-        'speed_reward_phase2': 0.3,       # 阶段2: 速度大小奖励(平地可更快)
+        'speed_reward': 0.5,              # 阶段1: 速度大小奖励 0.2→0.5
+        'speed_reward_phase2': 0.6,       # 阶段2: 速度大小奖励(平地可更快) 0.3→0.6
         # 反向速度惩罚
-        'reverse_penalty': -0.5,          # 速度与目标方向反向时的惩罚
+        'reverse_penalty': -1.0,          # 速度与目标方向反向时的惩罚 -0.5→-1.0
         # 时间惩罚 (每步)
         'time_penalty': -0.02,
         # 卡住时回退步数

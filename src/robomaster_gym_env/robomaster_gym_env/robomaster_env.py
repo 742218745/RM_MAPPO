@@ -96,8 +96,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         
         # real_time_factor: 仿真加速倍数
         # 需要与 Gazebo 世界文件中的 real_time_factor 一致
-        # 服务器 (CPU 30%): 5.0
-        self.real_time_factor = 5.0
+        # 服务器 (CPU 30%): 4.5
+        self.real_time_factor = 4.5
 
         # 每步伤害（固定为10）
         self.damage_per_step = 10.0
@@ -221,6 +221,11 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         terminated = self._check_terminated()
         truncated = self.current_step >= self.max_steps
 
+        # 终止时立即发零速度命令, 刹住底盘水平速度
+        # 这样出界/翻车后车只剩垂直下落, reset时set_pose后不会水平飞出去
+        if terminated:
+            self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+
         # 翻车时覆盖奖励为翻车惩罚
         if terminated and self.ros2_interface.is_tumbled():
             reward = self.config.reward_config.get('tumble', -10.0)
@@ -230,20 +235,20 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         if terminated:
             own_x, own_y = self._get_own_position_safe()
             if own_x is not None:
-                margin = 1.0  # 不能离边界 1m 内
+                margin = 1.5  # 不能离边界 1.5m 内
                 if own_x < margin or own_x > 28 - margin or own_y < margin or own_y > 15 - margin:
                     reward = self.config.reward_config.get('out_of_boundary', -100.0)
                     self._last_reward = reward
 
         # 检测仿真数据是否异常 (rtf 过低或过高)
-        # rtf 正常范围: [set_rtf * 0.8, set_rtf * 1.2]
+        # rtf 正常范围: [set_rtf * 0.7, set_rtf * 1.3]
         # 异常时标记 info['sim_unstable'] = True, 训练循环应跳过该步
         sim_unstable = False
         measured_rtf = self._real_time_factor_measured
         set_rtf = self.real_time_factor
         if measured_rtf > 0 and set_rtf > 0:
             rtf_ratio = measured_rtf / set_rtf
-            if rtf_ratio < 0.8 or rtf_ratio > 1.2:
+            if rtf_ratio < 0.7 or rtf_ratio > 1.3:
                 sim_unstable = True
 
         # 额外信息
@@ -255,8 +260,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
             'sim_unstable': sim_unstable,
         }
 
-        # 步内计时诊断 (每100步打印一次)
-        if self.current_step % 100 == 0:
+        # 步内计时诊断 (每500步打印一次)
+        if self.current_step % 500 == 0:
             t_end = time.time()
             total = (t_end - t0) * 1000
             action_ms = (t1 - t0) * 1000
@@ -312,14 +317,6 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         # 即使 pose_info 中找不到模型(出界后可能丢失), 也尝试 set_pose
         # Gazebo 的 set_pose service 按模型名查找, 只要模型还在世界就能设
         if True:
-            # 先发送零速度命令，清除机器人的惯性速度
-            # 否则 set_pose 只改位置不改速度，重置后机器人会带着旧速度乱飞
-            self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
-            # 等待速度归零 (最多0.5秒)
-            for _ in range(25):
-                self.ros2_interface.spin_once()
-                time.sleep(0.02)
-            
             # 红方初始位置: 特化模式固定, 常规模式随机
             spec_cfg = self.config.specialize_config
             if spec_cfg.get('enabled', False):
@@ -329,35 +326,53 @@ class RoboMasterGazeboEnv(gymnasium.Env):
                 reset_x, reset_y = self._sample_reset_position()
             
             # 重置位置，z 稍微抬高确保落地
+            # 注意: step()中terminated时已发过零速度, 水平速度已刹住
+            # 但set_pose只改位姿不清物理速度, 所以set_pose后仍需持续发零速度
+            # 翻车/侧滚后角速度可能很大, 需要高频反复set_pose强制位姿归正
             self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
             
-            # 等待机器人落地并稳定 (缩短等待时间)
-            time.sleep(0.2)
+            # 高频反复set_pose + 零速度, 强制位姿归正并清除残余物理速度
+            # 每5ms发一次, 持续0.5s (100次), 让Gazebo物理引擎来不及让车翻
+            for _ in range(100):
+                self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
+                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                self.ros2_interface.spin_once()
+                time.sleep(0.005)
             
-            # 检查机器人是否稳定（速度接近零且未翻车）
+            # 再等0.5s让车从z=0.35落地并稳定
+            for _ in range(25):
+                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                self.ros2_interface.spin_once()
+                time.sleep(0.02)
+            
+            # 检查机器人是否稳定: 已落地(z接近地面) 且 速度接近零 且 未翻车
             stable_wait = 0
-            max_stable_wait = 20  # 最多等待 1 秒
+            max_stable_wait = 20  # 最多再等 1 秒
             while stable_wait < max_stable_wait:
-                # 处理回调获取最新数据
+                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
                 self.ros2_interface.spin_once()
                 
-                # 如果翻车了，重新重置位置
+                # 如果翻车了，重新重置位置 (高频set_pose强制归正)
                 if self.ros2_interface.is_tumbled():
                     print("[WARN] 重置后翻车，重新重置位置")
-                    self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                    for _ in range(100):
+                        self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
+                        self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                        self.ros2_interface.spin_once()
+                        time.sleep(0.005)
+                    # 等落地稳定
                     for _ in range(25):
+                        self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
                         self.ros2_interface.spin_once()
                         time.sleep(0.02)
-                    # 翻车重试时仍用特化位置, 不破坏训练假设
-                    if spec_cfg.get('enabled', False):
-                        reset_x = spec_cfg.get('start_x', 8.64)
-                        reset_y = spec_cfg.get('start_y', 3.65)
-                    else:
-                        reset_x, reset_y = self._sample_reset_position()
-                    self.ros2_interface.set_robot_pose(reset_x, reset_y, 0.35, 0.0)
-                    time.sleep(0.2)
                     stable_wait = 0
                     continue
+                
+                # 检查是否已落地: z高度接近底盘正常高度(约0.28m)
+                own_pos = self.ros2_interface.get_robot_position()
+                on_ground = False
+                if own_pos is not None:
+                    on_ground = own_pos[2] < 0.35  # z < 0.35 认为已落地
                 
                 # 获取机器人速度（从 odom 数据）
                 odom_data = self.ros2_interface.state_data.get('odom')
@@ -368,7 +383,8 @@ class RoboMasterGazeboEnv(gymnasium.Env):
                     # 检查线速度和角速度是否足够小
                     linear_vel = (linear.get('x', 0)**2 + linear.get('y', 0)**2 + linear.get('z', 0)**2)**0.5
                     angular_vel = (angular.get('x', 0)**2 + angular.get('y', 0)**2 + angular.get('z', 0)**2)**0.5
-                    if linear_vel < 0.1 and angular_vel < 0.1:
+                    # 必须同时满足: 已落地 + 速度小, 避免弹跳最高点速度≈0时误判
+                    if on_ground and linear_vel < 0.1 and angular_vel < 0.1:
                         break
                 time.sleep(0.05)
                 stable_wait += 1
@@ -518,9 +534,18 @@ class RoboMasterGazeboEnv(gymnasium.Env):
         """
         # 底盘: FOLLOW_GIMBAL 模式
         if 'chassis_velocity' in action:
+            vel = action['chassis_velocity']
+            # 离散动作空间: 索引需要映射到实际速度
+            if isinstance(vel, np.ndarray) and np.issubdtype(vel.dtype, np.integer):
+                velocity_levels = [-2.0, -1.0, 0.0, 1.0, 2.0]
+                linear_x = velocity_levels[int(vel[0])]
+                linear_y = velocity_levels[int(vel[1])]
+            else:
+                linear_x = float(vel[0])
+                linear_y = float(vel[1])
             self.ros2_interface.send_chassis_follow_gimbal(
-                linear_x=action['chassis_velocity'][0],
-                linear_y=action['chassis_velocity'][1],
+                linear_x=linear_x,
+                linear_y=linear_y,
             )
 
         # 射击控制
@@ -709,12 +734,12 @@ class RoboMasterGazeboEnv(gymnasium.Env):
             rollback_steps = spec_cfg.get('stuck_rollback_steps', 30)
             if len(self._position_history) >= rollback_steps:
                 old_x, old_y, old_z = self._position_history[-rollback_steps]
-                # 先清零速度, 否则 set_pose 后带着旧速度漂移
-                self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
-                for _ in range(5):
-                    self.ros2_interface.spin_once()
-                    time.sleep(0.01)
+                # set_pose只改位姿不清物理速度, set_pose后必须持续发零速度
                 self.ros2_interface.set_robot_pose(old_x, old_y, 0.28, 0.0)
+                for _ in range(15):  # 0.3秒, 持续发零速度让车稳定
+                    self.ros2_interface.send_chassis_velocity(0.0, 0.0, 0.0)
+                    self.ros2_interface.spin_once()
+                    time.sleep(0.02)
                 self._spec_last_dist = None
                 self._spec_last_z = None
 

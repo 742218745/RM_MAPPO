@@ -205,7 +205,7 @@ class MAPPOActor(nn.Module):
     MAPPO Actor 网络 
 
     动作空间:
-        chassis_velocity: (2,) 连续, 范围 [-2,2], [-2,2] (angular_z 固定为0)
+        chassis_velocity: MultiDiscrete([5, 5]) 离散, 速度等级 [-2, -1, 0, 1, 2] m/s
         shoot: 9类离散, 0=不射击, 1-6=射击机器人, 7=前哨站, 8=基地
     """
     def __init__(
@@ -229,12 +229,14 @@ class MAPPOActor(nn.Module):
             nn.ReLU(),
         )
 
-        # ===== 动作头 (只有两个) =====
-        # 底盘速度: [linear_x, linear_y] (angular_z 固定为0)
-        self.chassis_head = ContinuousHead(
-            hidden_dim=hidden_dim, action_dim=2,
-            low=[-2.0, -2.0],
-            high=[2.0, 2.0],
+        # ===== 动作头 (都是离散) =====
+        # 底盘速度: MultiDiscrete([5, 5]) - 两个维度各5个选择
+        # 使用两个独立的 DiscreteHead
+        self.chassis_head_x = DiscreteHead(
+            hidden_dim=hidden_dim, n_categories=5,
+        )
+        self.chassis_head_y = DiscreteHead(
+            hidden_dim=hidden_dim, n_categories=5,
         )
 
         # 射击: 0=不射击, 1-6=射击机器人, 7=前哨站, 8=基地
@@ -251,29 +253,30 @@ class MAPPOActor(nn.Module):
             state_tensor: (batch, 11)
 
         Returns:
-            chassis_mean, chassis_std: 底盘速度分布参数
-            shoot_logits:              射击 logits
-            hidden:                    融合特征
+            chassis_x_logits: 底盘x方向速度的logits
+            chassis_y_logits: 底盘y方向速度的logits
+            shoot_logits:      射击的logits
+            hidden:            融合特征
         """
         robot_feat = self.robot_encoder(robot_tensor)
         state_feat = self.state_encoder(state_tensor)
         hidden = self.fusion(torch.cat([robot_feat, state_feat], dim=-1))
 
-        chassis_mean, chassis_std = self.chassis_head(hidden)
+        chassis_x_logits = self.chassis_head_x(hidden)
+        chassis_y_logits = self.chassis_head_y(hidden)
         shoot_logits = self.shoot_head(hidden)
 
-        return chassis_mean, chassis_std, shoot_logits, hidden
+        return chassis_x_logits, chassis_y_logits, shoot_logits, hidden
 
     def get_action(self, obs: dict, deterministic: bool = False, device: str = 'cpu'):
         """
         从环境观测采样动作
 
-        只输出 chassis_velocity 和 shoot, 云台角度由 Gym 环境内部
-        根据 shoot 目标自动计算并发给 ROS2, 不需要 Actor 输出
+        底盘速度改为离散: MultiDiscrete([5, 5])
 
         Args:
             obs: Gym 环境返回的观测字典
-            deterministic: True 则取均值/argmax
+            deterministic: True 则取argmax
             device: 'cpu' 或 'cuda'
 
         Returns:
@@ -286,22 +289,29 @@ class MAPPOActor(nn.Module):
         state_tensor = state_tensor.unsqueeze(0)
 
         # 前向
-        chassis_mean, chassis_std, shoot_logits, _ = \
+        chassis_x_logits, chassis_y_logits, shoot_logits, _ = \
             self.forward(robot_tensor, state_tensor)
 
-        # 采样
-        chassis_action, chassis_logp = self.chassis_head.sample(
-            chassis_mean, chassis_std, deterministic)
+        # 采样底盘速度 (两个独立的离散动作)
+        chassis_x_action, chassis_x_logp = self.chassis_head_x.sample(
+            chassis_x_logits, deterministic)
+        chassis_y_action, chassis_y_logp = self.chassis_head_y.sample(
+            chassis_y_logits, deterministic)
+        
+        # 采样射击动作
         shoot_action, shoot_logp = self.shoot_head.sample(
             shoot_logits, deterministic)
 
-        # 组装动作字典 (不含 gimbal_angle, 环境内部自动计算)
+        # 组装动作字典 - chassis_velocity 是 [idx_x, idx_y]
         action = {
-            'chassis_velocity': chassis_action.squeeze(0).detach().cpu().numpy(),
+            'chassis_velocity': np.array([
+                chassis_x_action.squeeze(0).detach().cpu().item(),
+                chassis_y_action.squeeze(0).detach().cpu().item()
+            ], dtype=np.int64),
             'shoot': shoot_action.squeeze(0).detach().cpu().item(),
         }
 
-        log_prob = (chassis_logp + shoot_logp).squeeze(0).detach().cpu().item()
+        log_prob = (chassis_x_logp + chassis_y_logp + shoot_logp).squeeze(0).detach().cpu().item()
 
         return action, log_prob
 
@@ -313,19 +323,26 @@ class MAPPOActor(nn.Module):
         Args:
             robot_batch:     (batch, 10, 4)
             state_batch:     (batch, 11)
-            chassis_actions: (batch, 2)
+            chassis_actions: (batch, 2) 整数索引 [idx_x, idx_y]
             shoot_actions:   (batch,) 整数
 
         Returns:
             log_prob: (batch,)
             entropy:  (batch,)
         """
-        chassis_mean, chassis_std, shoot_logits, _ = \
+        chassis_x_logits, chassis_y_logits, shoot_logits, _ = \
             self.forward(robot_batch, state_batch)
 
-        chassis_logp, chassis_ent = self.chassis_head.evaluate(
-            chassis_actions, chassis_mean, chassis_std)
+        # 分离底盘动作的两个维度
+        chassis_x_actions = chassis_actions[:, 0]
+        chassis_y_actions = chassis_actions[:, 1]
+        
+        chassis_x_logp, chassis_x_ent = self.chassis_head_x.evaluate(
+            chassis_x_actions, chassis_x_logits)
+        chassis_y_logp, chassis_y_ent = self.chassis_head_y.evaluate(
+            chassis_y_actions, chassis_y_logits)
         shoot_logp, shoot_ent = self.shoot_head.evaluate(
             shoot_actions, shoot_logits)
 
-        return chassis_logp + shoot_logp, chassis_ent + shoot_ent
+        return chassis_x_logp + chassis_y_logp + shoot_logp, \
+               chassis_x_ent + chassis_y_ent + shoot_ent
